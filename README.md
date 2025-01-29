@@ -18,6 +18,8 @@ For benchmarking purposes a tuned local Apache webserver was used as the backend
 
 - If building Python from source run `pip3 install cython setuptools`.
 
+- If building Python from source there are compiler flags available such as `--enable-optimizations --enable-experimental-jit` which improve performance.
+
 - To build `proxy.pyx` run `python setup.py build_ext --inplace`.
 
 - On Ubuntu, run `sudo apt update` followed by `sudo apt -y install curl wrk siege`.
@@ -36,35 +38,41 @@ The output will include the results of `wrk` and `siege`. On the test system, wh
 
 **wrk**
 
-```Running 30s test @ http://127.0.0.1:8888/index.html
+```
+Running 30s test @ http://127.0.0.1:8888/index.html
   1 threads and 100 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency    21.54ms    2.12ms  38.92ms   80.87%
-    Req/Sec     4.57k   399.68     5.42k    55.67%
+    Latency    20.62ms    1.38ms  38.09ms   80.11%
+    Req/Sec     4.78k   295.64     5.51k    81.67%
   Latency Distribution
-     50%   21.18ms
-     75%   22.30ms
-     90%   23.82ms
-     99%   29.35ms
-  136655 requests in 30.03s, 63.21MB read
-  Non-2xx or 3xx responses: 136655
-Requests/sec:   4549.94
-Transfer/sec:      2.10MB
+     50%   20.47ms
+     75%   21.10ms
+     90%   22.00ms
+     99%   25.41ms
+  142800 requests in 30.02s, 66.05MB read
+  Non-2xx or 3xx responses: 142800
+Requests/sec:   4756.53
+Transfer/sec:      2.20MB
 ```
 
 **siege**
 
-```	"transactions":			      124230,
+```
+	"transactions":			      131096,
 	"availability":			      100.00,
-	"elapsed_time":			       29.74,
-	"data_transferred":		       35.90,
+	"elapsed_time":			       29.69,
+	"data_transferred":		       37.88,
 	"response_time":		        0.02,
-	"transaction_rate":		     4177.20,
-	"throughput":			        1.21,
-	"concurrency":			       99.83,
+	"transaction_rate":		     4415.49,
+	"throughput":			        1.28,
+	"concurrency":			       99.82,
 	"successful_transactions":	           0,
 	"failed_transactions":		           0,
 	"longest_transaction":		        0.04,
 	"shortest_transaction":		        0.00
 ```
+
+
+
+
 
