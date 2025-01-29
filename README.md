@@ -63,7 +63,6 @@ Transfer/sec:      2.10MB
 	"successful_transactions":	           0,
 	"failed_transactions":		           0,
 	"longest_transaction":		        0.04,
-	"shortest_transaction":		        0.00
-}
+	"shortest_transaction":		        0.00}
 ```
 
