@@ -16,6 +16,8 @@ For benchmarking purposes a tuned local Apache webserver was used as the backend
 
 - After installing Miniforge, run `mamba install cython`.
 
+- If building Python from source run `pip3 install cython setuptools`.
+
 - To build `proxy.pyx` run `python setup.py build_ext --inplace`.
 
 - On Ubuntu, run `sudo apt update` followed by `sudo apt -y install curl wrk siege`.
@@ -26,7 +28,7 @@ To run the benchmark:
 
 - Make sure Apache is serving `index.html`.
 - Start the proxy with `python -c "import proxy"`.
-- Run `bash bench.sh`
+- Run `bash bench.sh`.
 
 ## Results
 
