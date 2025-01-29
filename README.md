@@ -52,7 +52,7 @@ Transfer/sec:      2.10MB
 
 **siege**
 
-```{	"transactions":			      124230,
+```	"transactions":			      124230,
 	"availability":			      100.00,
 	"elapsed_time":			       29.74,
 	"data_transferred":		       35.90,
@@ -63,6 +63,6 @@ Transfer/sec:      2.10MB
 	"successful_transactions":	           0,
 	"failed_transactions":		           0,
 	"longest_transaction":		        0.04,
-	"shortest_transaction":		        0.00}
+	"shortest_transaction":		        0.00
 ```
 
