@@ -4,7 +4,7 @@ This is an HTTP/HTTPS CONNECT proxy written in async Python, which has been Cyth
 
 ## System Tuning
 
-In order to run the C10K benchmark on Linux you may need to increase the number of allowed file handles.
+In order to run the C10K benchmark on Linux you may need to increase the number of allowed file handles. There are a variety of other ways to tune the system as well.
 
 ## Benchmark Environment
 
