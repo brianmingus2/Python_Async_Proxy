@@ -1,1 +1,1 @@
-An HTTP/HTTPS CONNECT proxy written in Python.
+A solution to the C10K problem in Pure Python.
