@@ -1,10 +1,8 @@
-A solution to the C10K problem in Pure Python.
-
 This is an HTTP/HTTPS CONNECT proxy written in async Python, which has been Cythonized.
 
 ## System Tuning
 
-In order to run the C10K benchmark on Linux you may need to increase the number of allowed file handles. There are a variety of other ways to tune the system as well.
+In order to run the benchmark on Linux you may need to increase the number of allowed file handles. There are a variety of other ways to tune the system as well.
 
 ## Benchmark Environment
 
@@ -34,7 +32,7 @@ To run the benchmark:
 
 ## Results
 
-The output will include the results of `wrk` and `siege`. On the test system, which is Ubuntu LTS on VMWare Workstation Pro, it gets up to 4550 requests per second, which is almost halfway to C10K.
+The output will include the results of `wrk` and `siege`.
 
 **wrk**
 
