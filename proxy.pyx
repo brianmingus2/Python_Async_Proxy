@@ -82,7 +82,7 @@ cdef extern from "netinet/in.h":
     ctypedef struct sockaddr_in:
         uint16_t sin_family
         in_port_t sin_port
-        struct in_addr sin_addr
+        in_addr sin_addr
 
 cdef extern from "fcntl.h":
     int fcntl(int fd, int cmd, ...)
@@ -243,21 +243,31 @@ cdef class SpliceProxy:
         return pipe2_wrap(out, 0x80000 | 0x800)  # O_CLOEXEC | O_NONBLOCK
 
     cpdef run(self, int max_events=4096, int splice_len=1<<20, int sleep_ns=0):
-        cdef epoll_event* events = <epoll_event*> malloc(max_events * sizeof(epoll_event))
+        cdef epoll_event* events
+        cdef int fds[2]
+        cdef int n, i
+        cdef uint64_t ufd
+        cdef uint32_t ev
+        cdef int src, dst
+        cdef int r, w
+        cdef int more
+        cdef int64_t *off_ptr = NULL
+        cdef timespec ts
+
+        events = <epoll_event*> malloc(max_events * sizeof(epoll_event))
         if not events:
             raise MemoryError()
-        cdef int fds[2]
         try:
             while True:
-                cdef int n = epoll_wait(self.epfd, events, max_events, 1000)
+                n = epoll_wait(self.epfd, events, max_events, 1000)
                 if n < 0:
                     if errno == EINTR:
                         continue
                     raise OSError(errno, "epoll_wait")
 
                 for i in range(n):
-                    cdef uint64_t ufd = <uint64_t> events[i].data
-                    cdef uint32_t ev = events[i].events
+                    ufd = <uint64_t> events[i].data
+                    ev = events[i].events
 
                     if ufd == self.listen_fd:
                         # Accept as many as possible
@@ -278,7 +288,8 @@ cdef class SpliceProxy:
                                 enable_cork(ufd2, 1)
 
                             # pipes for splice in both directions
-                            cdef int p1[2]; cdef int p2[2]
+                            cdef int p1[2]
+                            cdef int p2[2]
                             if self.make_pipes(p1) != 0 or self.make_pipes(p2) != 0:
                                 close(cfd); close(ufd2)
                                 continue
@@ -287,25 +298,22 @@ cdef class SpliceProxy:
                             x_epoll_ctl(self.epfd, EPOLL_CTL_ADD, cfd, ev_of(cfd, True))
                             x_epoll_ctl(self.epfd, EPOLL_CTL_ADD, ufd2, ev_of(ufd2, True))
 
-                            # stash pipes in epoll udata by "shadow" fds: use fcntl to store? Not portable in Python,
-                            # so we rely on per-fd maps in Python layer (below).
                             ConnMap.add(cfd, ufd2, p1, p2)
                             ConnMap.add(ufd2, cfd, p2, p1)
 
                     else:
-                        # Relay data using splice in whichever direction became ready
-                        cdef int src = <int> ufd
-                        cdef int dst = ConnMap.peer(src)
+                        # Relay data using splice
+                        src = <int> ufd
+                        dst = ConnMap.peer(src)
                         if dst < 0:
                             x_epoll_ctl(self.epfd, EPOLL_CTL_DEL, src, NULL)
                             close(src)
                             continue
-                        cdef int* pipe12 = ConnMap.pipe_out(src)  # pipe for src->dst
-                        cdef int more = 1
+                        cdef int* pipe12 = ConnMap.pipe_out(src)
+                        more = 1
                         while True:
-                            # src -> pipe[1]
-                            cdef int64_t *off_ptr = NULL
-                            cdef int r = splice(src, NULL, pipe12[1], NULL, splice_len, SPLICE_F_NONBLOCK | SPLICE_F_MOVE | SPLICE_F_MORE)
+                            r = splice(src, NULL, pipe12[1], NULL, splice_len,
+                                       SPLICE_F_NONBLOCK | SPLICE_F_MOVE | SPLICE_F_MORE)
                             if r == 0:
                                 # EOF from src
                                 shutdown(dst, 1)  # SHUT_WR
@@ -318,7 +326,8 @@ cdef class SpliceProxy:
                                 break
                             # pipe[0] -> dst
                             while r > 0:
-                                cdef int w = splice(pipe12[0], NULL, dst, NULL, r, SPLICE_F_NONBLOCK | SPLICE_F_MOVE | SPLICE_F_MORE)
+                                w = splice(pipe12[0], NULL, dst, NULL, r,
+                                           SPLICE_F_NONBLOCK | SPLICE_F_MOVE | SPLICE_F_MORE)
                                 if w < 0:
                                     if errno in (EAGAIN, EWOULDBLOCK):
                                         break
@@ -328,15 +337,16 @@ cdef class SpliceProxy:
                                 r -= w
                         # Opportunistic uncork when neither side has pending data
                         if self.cork:
-                            enable_cork(src, 0); enable_cork(dst, 0)
+                            enable_cork(src, 0)
+                            enable_cork(dst, 0)
 
                 if sleep_ns > 0:
-                    cdef timespec ts
                     ts.tv_sec = 0
                     ts.tv_nsec = sleep_ns
                     nanosleep(&ts, NULL)
         finally:
             free(events)
+
 
 # ---- Minimal per-fd metadata in Python ----
 cdef class _ConnMap:
