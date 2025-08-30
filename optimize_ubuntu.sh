@@ -3,8 +3,7 @@ set -euo pipefail
 
 echo "[*] Installing dependencies..."
 sudo apt update
-sudo apt install -y build-essential python3-dev python3-pip cython uvloop \
-    curl jq siege wrk nginx
+sudo apt install -y build-essential python3-dev python3-pip curl jq siege wrk nginx
 
 echo "[*] Raising ulimit for open files..."
 if ! grep -q "ulimit -n" ~/.bashrc; then
