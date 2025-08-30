@@ -1,34 +1,26 @@
+
 from setuptools import setup, Extension
 from Cython.Build import cythonize
-import sys
+import os
 
-extra_compile_args = ["-O3", "-march=native", "-fno-strict-aliasing"]
-if sys.platform != "win32":
-    extra_compile_args += ["-fvisibility=hidden"]
+extra_compile_args = [
+    "-O3","-march=native","-mtune=native","-fno-plt","-pipe",
+    "-flto","-fomit-frame-pointer","-funroll-loops",
+]
+extra_link_args = ["-flto"]
 
 extensions = [
     Extension(
-        name="proxy",
+        "proxy",
         sources=["proxy.pyx"],
-        extra_compile_args=extra_compile_args,
         libraries=[],
+        extra_compile_args=extra_compile_args,
+        extra_link_args=extra_link_args,
     )
 ]
 
 setup(
-    name="ultra_proxy",
-    version="1.0.0",
-    ext_modules=cythonize(
-        extensions,
-        language_level=3,
-        annotate=False,
-        compiler_directives={
-            "boundscheck": False,
-            "wraparound": False,
-            "cdivision": True,
-            "initializedcheck": False,
-            "nonecheck": False,
-            "embedsignature": False,
-        },
-    ),
+    name="proxy_fast",
+    version="0.1.0",
+    ext_modules=cythonize(extensions, language_level=3, annotate=False, nthreads=os.cpu_count() or 4),
 )

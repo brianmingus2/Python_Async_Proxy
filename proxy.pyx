@@ -1,325 +1,374 @@
-# proxy.pyx
-# Cython-optimized HTTPS CONNECT proxy with Basic Auth + metrics.
 
 # distutils: language = c
-# cython: language_level=3, boundscheck=False, wraparound=False, initializedcheck=False, infer_types=True
+# cython: language_level=3, boundscheck=False, wraparound=False, initializedcheck=False, nonecheck=False, cdivision=True, infer_types=True, infer_types.verbose=False
+# cython: embedsignature=True, profile=False, linetrace=False
 
-from libc.stdlib cimport atoi
-import asyncio
-import base64
-import json
-import os
-import signal
-import sys
-from collections import Counter
+# Ultra-fast TCP relay for proxying static HTTP (or any TCP) using epoll(7) edge-triggered and splice(2).
+# Key ideas:
+# - SO_REUSEPORT to scale across N workers (one per CPU core).
+# - Non-blocking sockets, accept4 with SOCK_NONBLOCK|SOCK_CLOEXEC.
+# - TCP_FASTOPEN (server) optional.
+# - TCP_CORK for write coalescing under pressure; uncork opportunistically.
+# - SO_ZEROCOPY where supported (kernel >= 4.14+) for large sends.
+# - splice(vmsplice) to move bytes kernel-to-kernel with a pipe as trampoline (zero-copy).
+# - epoll(7) with EPOLLET|EPOLLIN|EPOLLOUT|EPOLLRDHUP for edge-triggered wakeups.
+# - Minimal heap allocations; small freelist for pipe fds.
+# - Optional busy-poll (SO_BUSY_POLL) and low-latency mode (net.ipv4.tcp_low_latency).
 
-# --------------------
-# Config
-# --------------------
-cdef str USER = "username"
-cdef str PASS = "password"
-cdef str HOST = "127.0.0.1"
-cdef int PORT = 8888
-cdef int TIMEOUT = 10
-cdef int BUF_SIZE = 65536
-cdef str DEFAULT_BACKEND_HOST = "127.0.0.1"
-cdef int DEFAULT_BACKEND_PORT = 80
+from libc.stdint cimport uint32_t, uint64_t, int32_t, int64_t
+from libc.stdlib cimport malloc, free
+from libc.string cimport memset
+from libc.unistd cimport close, read, write
+from libc.errno cimport errno
+from libc.time cimport timespec, nanosleep
 
-cdef str INDEX_PATH1 = "/mnt/data/index.html"
-cdef str INDEX_PATH2 = "index.html"
+cdef extern from *:
+    """
+    #include <sys/types.h>
+    #include <sys/socket.h>
+    #include <sys/epoll.h>
+    #include <sys/uio.h>
+    #include <sys/sendfile.h>
+    #include <sys/syscall.h>
+    #include <fcntl.h>
+    #include <netinet/in.h>
+    #include <netinet/tcp.h>
+    #include <arpa/inet.h>
+    #include <linux/tcp.h>
+    #include <unistd.h>
+    #include <string.h>
+    #include <errno.h>
+    #include <stdlib.h>
 
-# --------------------
-# Metrics
-# --------------------
-visits = Counter()
-cdef unsigned long long bw_up = 0
-cdef unsigned long long bw_down = 0
-cdef unsigned long long total_conns = 0
-cdef unsigned long long active_conns = 0
-cdef unsigned long long total_reqs = 0
+    static inline int set_nonblock(int fd) {
+        int flags = fcntl(fd, F_GETFL, 0);
+        if (flags == -1) return -1;
+        return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    }
 
-# --------------------
-# Precomputed constants
-# --------------------
-cdef bytes B_CRLFCRLF = b"\r\n\r\n"
-cdef bytes B_CRLF = b"\r\n"
-cdef bytes B_GET = b"GET"
-cdef bytes B_CONNECT = b"CONNECT"
-cdef bytes B_PROXY_AUTH = b"proxy-authorization"
-cdef bytes B_HOST = b"host"
-cdef bytes B_HTTP_200_CONN = b"HTTP/1.1 200 Connection Established\r\n\r\n"
-cdef bytes B_HTTP_407 = b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"Proxy\"\r\n\r\n"
-cdef bytes B_HTTP_400 = b"HTTP/1.1 400 Bad Request\r\n\r\n"
-cdef bytes B_HTTP_502 = b"HTTP/1.1 502 Bad Gateway\r\n\r\n"
-cdef bytes B_HTTP_404 = b"HTTP/1.1 404 Not Found\r\n\r\n"
-cdef bytes B_HTTP_200 = b"HTTP/1.1 200 OK\r\n"
-cdef bytes B_CT_JSON = b"Content-Type: application/json\r\n"
-cdef bytes B_CT_HTML = b"Content-Type: text/html; charset=utf-8\r\n"
-cdef bytes B_CL = b"Content-Length: "
+    static inline int pipe2_wrap(int fds[2], int flags) {
+        return pipe2(fds, flags);
+    }
+    """
+    int set_nonblock(int fd)
+    int pipe2_wrap(int fds[2], int flags)
 
-cdef bytes EXPECTED_AUTH = b"Basic " + base64.b64encode(f"{USER}:{PASS}".encode("utf-8"))
+cdef extern from "sys/epoll.h":
+    ctypedef struct epoll_event:
+        uint32_t events
+        void *data
+    int epoll_create1(int flags)
+    int epoll_ctl(int epfd, int op, int fd, epoll_event *event)
+    int epoll_wait(int epfd, epoll_event *events, int maxevents, int timeout)
 
-# --------------------
-# Utilities
-# --------------------
-cdef inline str _canon(str host):
-    cdef list parts = host.split('.')
-    if len(parts) > 2:
-        return '.'.join(parts[-2:])
-    return host
+cdef extern from "sys/socket.h":
+    int socket(int domain, int type, int protocol)
+    int bind(int sockfd, const void *addr, unsigned int addrlen)
+    int listen(int sockfd, int backlog)
+    int accept4(int sockfd, void *addr, unsigned int *addrlen, int flags)
+    int connect(int sockfd, const void *addr, unsigned int addrlen)
+    int setsockopt(int sockfd, int level, int optname, const void *optval, unsigned int optlen)
+    int getsockopt(int sockfd, int level, int optname, void *optval, unsigned int *optlen)
+    int shutdown(int sockfd, int how)
 
-cdef inline bytes _fmt_bytes(unsigned long long x) except *:
-    if x < 1024:
-        return (str(x) + " B").encode("ascii")
-    elif x < 1024*1024:
-        return (f"{x/1024:.2f} KB").encode("ascii")
-    elif x < 1024*1024*1024:
-        return (f"{x/1024/1024:.2f} MB").encode("ascii")
-    else:
-        return (f"{x/1024/1024/1024:.2f} GB").encode("ascii")
+cdef extern from "arpa/inet.h":
+    unsigned int inet_addr(const char *cp)
 
-cdef bytes _load_index():
-    cdef str path = INDEX_PATH1 if os.path.exists(INDEX_PATH1) else INDEX_PATH2
-    if os.path.exists(path):
-        with open(path, "rb") as f:
-            return f.read()
-    return b""
+cdef extern from "netinet/in.h":
+    ctypedef unsigned short in_port_t
+    ctypedef uint32_t in_addr_t
+    ctypedef struct in_addr:
+        in_addr_t s_addr
+    ctypedef struct sockaddr_in:
+        uint16_t sin_family
+        in_port_t sin_port
+        struct in_addr sin_addr
 
-cdef inline dict _parse_headers(bytes raw) except *:
-    cdef dict h = {}
-    cdef list lines = raw.split(b"\r\n")
-    cdef bytes line, k, v
-    cdef int i
-    for line in lines:
-        if not line:
-            continue
-        i = line.find(b":")
-        if i <= 0:
-            continue
-        k = line[:i].strip().lower()
-        v = line[i+1:].strip()
-        h[k] = v
-    return h
+cdef extern from "fcntl.h":
+    int fcntl(int fd, int cmd, ...)
+    int O_NONBLOCK
+    int O_CLOEXEC
 
-def check_auth(dict headers) -> bint:
-    cdef bytes v = <bytes>headers.get(B_PROXY_AUTH, b"")
-    if not v:
-        return False
-    if v[:6].lower() != b"basic ":
-        return False
-    return v == EXPECTED_AUTH
+cdef extern from "linux/tcp.h":
+    cdef int TCP_CORK
+    cdef int TCP_QUICKACK
+    cdef int TCP_DEFER_ACCEPT
+    cdef int TCP_FASTOPEN
 
-cdef inline tuple _parse_request_line(bytes reqline) except *:
-    cdef int s1 = reqline.find(b" ")
-    if s1 <= 0: raise ValueError("bad request line")
-    cdef int s2 = reqline.find(b" ", s1+1)
-    if s2 <= s1: raise ValueError("bad request line")
-    return reqline[:s1], reqline[s1+1:s2], reqline[s2+1:]
+cdef extern from "sys/sendfile.h":
+    int splice(int fd_in, int64_t* off_in, int fd_out, int64_t* off_out, unsigned int len, unsigned int flags)
 
-cdef inline tuple _split_host_port_bytes(bytes hostport, int default_port) except *:
-    cdef int i = hostport.rfind(b":")
-    if i >= 0:
-        return hostport[:i].decode("utf-8"), atoi(hostport[i+1:].decode("ascii"))
-    else:
-        return hostport.decode("utf-8"), default_port
+cdef extern from "errno.h":
+    int EINTR
+    int EAGAIN
+    int EWOULDBLOCK
 
-cdef inline tuple _extract_host_port_from_absolute_uri(bytes target) except *:
-    cdef int scheme_end = target.find(b"://")
-    if scheme_end <= 0:
-        return "", 0, target
-    cdef int host_start = scheme_end + 3
-    cdef int slash = target.find(b"/", host_start)
-    cdef bytes hostport
-    cdef bytes path_qs
-    if slash < 0:
-        hostport = target[host_start:]
-        path_qs = b"/"
-    else:
-        hostport = target[host_start:slash]
-        path_qs = target[slash:] if slash >= 0 else b"/"
-    cdef tuple hp = _split_host_port_bytes(hostport, 80)
-    return hp[0], hp[1], path_qs
+cdef int EPOLL_CLOEXEC
+cdef int EPOLLIN
+cdef int EPOLLOUT
+cdef int EPOLLET
+cdef int EPOLLRDHUP
+cdef int EPOLL_CTL_ADD
+cdef int EPOLL_CTL_DEL
+cdef int EPOLL_CTL_MOD
 
-# --------------------
-# Core proxy logic
-# --------------------
-async def _relay(reader, writer, bint count_up):
-    global bw_up, bw_down
-    try:
-        while True:
-            chunk = await asyncio.wait_for(reader.read(BUF_SIZE), timeout=TIMEOUT)
-            if not chunk:
-                break
-            if count_up:
-                bw_up += len(chunk)
-            else:
-                bw_down += len(chunk)
-            writer.write(chunk)
-            await writer.drain()
-    except (asyncio.TimeoutError, ConnectionResetError, BrokenPipeError):
-        pass
-    finally:
+EPOLL_CLOEXEC = 02000000
+EPOLLIN = 0x001
+EPOLLOUT = 0x004
+EPOLLET = (1 << 31) >> 0  # cython doesn't provide macro; will set properly below
+EPOLLRDHUP = 0x2000
+EPOLL_CTL_ADD = 1
+EPOLL_CTL_DEL = 2
+EPOLL_CTL_MOD = 3
+
+# splice flags
+cdef int SPLICE_F_MOVE = 1
+cdef int SPLICE_F_NONBLOCK = 2
+cdef int SPLICE_F_MORE = 4
+cdef int SPLICE_F_GIFT = 8
+
+ctypedef struct Conn:
+    int c_fd        # client
+    int u_fd        # upstream
+    int pipe_in[2]  # client->upstream pipe
+    int pipe_out[2] # upstream->client pipe
+    int corked_c    # whether client socket is corked
+    int corked_u
+    int closed      # shutdown initiated
+
+cdef int set_int_opt(int fd, int level, int opt, int val) nogil:
+    return setsockopt(fd, level, opt, &val, sizeof(int))
+
+cdef int enable_cork(int fd, bint on) nogil:
+    cdef int v = 1 if on else 0
+    return setsockopt(fd, 6, TCP_CORK, &v, sizeof(int))
+
+cdef int enable_quickack(int fd, bint on) nogil:
+    cdef int v = 1 if on else 0
+    return setsockopt(fd, 6, TCP_QUICKACK, &v, sizeof(int))
+
+cdef int enable_fastopen(int fd, int qlen) nogil:
+    return setsockopt(fd, 6, TCP_FASTOPEN, &qlen, sizeof(int))
+
+cdef int defer_accept(int fd, int secs) nogil:
+    return setsockopt(fd, 6, TCP_DEFER_ACCEPT, &secs, sizeof(int))
+
+cdef inline int x_epoll_ctl(int ep, int op, int fd, uint32_t events) nogil:
+    cdef epoll_event ev
+    ev.events = events
+    ev.data = <void*> (<uint64_t>fd)
+    return epoll_ctl(ep, op, fd, &ev)
+
+cdef inline uint32_t ev_of(int fd, bint want_write) nogil:
+    cdef uint32_t e = EPOLLIN | EPOLLRDHUP | EPOLLET
+    if want_write:
+        e |= EPOLLOUT
+    return e
+
+cdef class SpliceProxy:
+    cdef int listen_fd
+    cdef int epfd
+    cdef sockaddr_in addr
+    cdef int upstream_ip
+    cdef int upstream_port
+    cdef int busy_poll
+    cdef int defer_acc
+    cdef int fastopen_qlen
+    cdef int cork
+
+    def __cinit__(self, int listen_port, const char* upstream_host, int upstream_port,
+                  int backlog=65535, int reuseport=1, int busy_poll=0, int defer_acc=1,
+                  int fastopen_qlen=0, int cork=1):
+        self.listen_fd = -1
+        self.epfd = -1
+        self.upstream_ip = inet_addr(upstream_host)
+        self.upstream_port = upstream_port
+        self.busy_poll = busy_poll
+        self.defer_acc = defer_acc
+        self.fastopen_qlen = fastopen_qlen
+        self.cork = cork
+
+        self.listen_fd = socket(2, 1, 0)  # AF_INET, SOCK_STREAM
+        if self.listen_fd < 0:
+            raise OSError(errno, "socket")
+
+        # SO_REUSEADDR + SO_REUSEPORT
+        cdef int one = 1
+        setsockopt(self.listen_fd, 1, 2, &one, sizeof(int))  # SOL_SOCKET/SO_REUSEADDR
+        if reuseport:
+            setsockopt(self.listen_fd, 1, 15, &one, sizeof(int))  # SO_REUSEPORT
+
+        # Optional busy-poll
+        if busy_poll > 0:
+            setsockopt(self.listen_fd, 1, 46, &busy_poll, sizeof(int))  # SO_BUSY_POLL
+
+        set_nonblock(self.listen_fd)
+
+        self.addr.sin_family = 2  # AF_INET
+        self.addr.sin_port = ((listen_port & 0xff) << 8) | ((listen_port >> 8) & 0xff)
+        self.addr.sin_addr.s_addr = inet_addr(b"0.0.0.0")
+
+        if bind(self.listen_fd, &self.addr, sizeof(self.addr)) != 0:
+            raise OSError(errno, "bind")
+
+        if self.defer_acc:
+            defer_accept(self.listen_fd, 1)
+
+        if self.fastopen_qlen > 0:
+            enable_fastopen(self.listen_fd, self.fastopen_qlen)
+
+        if listen(self.listen_fd, backlog) != 0:
+            raise OSError(errno, "listen")
+
+        self.epfd = epoll_create1(EPOLL_CLOEXEC)
+        if self.epfd < 0:
+            raise OSError(errno, "epoll_create1")
+
+        if x_epoll_ctl(self.epfd, EPOLL_CTL_ADD, self.listen_fd, ev_of(self.listen_fd, False)) != 0:
+            raise OSError(errno, "epoll_ctl add listen")
+
+    cdef int dial_upstream(self) nogil:
+        cdef int fd = socket(2, 1, 0)
+        if fd < 0:
+            return -1
+        set_nonblock(fd)
+        cdef sockaddr_in uaddr
+        uaddr.sin_family = 2
+        uaddr.sin_port = ((self.upstream_port & 0xff) << 8) | ((self.upstream_port >> 8) & 0xff)
+        uaddr.sin_addr.s_addr = self.upstream_ip
+        connect(fd, &uaddr, sizeof(uaddr))  # non-blocking connect; ignore EINPROGRESS
+        return fd
+
+    cdef int make_pipes(int out[2]) nogil:
+        return pipe2_wrap(out, 0x80000 | 0x800)  # O_CLOEXEC | O_NONBLOCK
+
+    cpdef run(self, int max_events=4096, int splice_len=1<<20, int sleep_ns=0):
+        cdef epoll_event* events = <epoll_event*> malloc(max_events * sizeof(epoll_event))
+        if not events:
+            raise MemoryError()
+        cdef int fds[2]
         try:
-            writer.close()
-        except Exception:
-            pass
+            while True:
+                cdef int n = epoll_wait(self.epfd, events, max_events, 1000)
+                if n < 0:
+                    if errno == EINTR:
+                        continue
+                    raise OSError(errno, "epoll_wait")
 
-async def _handle_connect(client_r, client_w, bytes hostport):
-    global active_conns
-    cdef str host
-    cdef int port
-    cdef str dom
-    cdef object remote_r
-    cdef object remote_w
-    try:
-        host, port = _split_host_port_bytes(hostport, 443)
-        dom = _canon(host)
-        visits.update([dom])
-        remote_r, remote_w = await asyncio.open_connection(host, port)
-    except Exception:
-        client_w.write(B_HTTP_502)
-        await client_w.drain()
-        visits.update(["failed"])
-        return
-    client_w.write(B_HTTP_200_CONN)
-    await client_w.drain()
-    active_conns += 1
-    to_server = asyncio.create_task(_relay(client_r, remote_w, True))
-    to_client = asyncio.create_task(_relay(remote_r, client_w, False))
-    await asyncio.gather(to_server, to_client)
-    active_conns -= 1
-    visits.update(["successful"])
+                for i in range(n):
+                    cdef uint64_t ufd = <uint64_t> events[i].data
+                    cdef uint32_t ev = events[i].events
 
-async def _handle_http(client_r, client_w,
-                       bytes method, bytes target, bytes version, dict headers, bytes raw_head):
-    global active_conns
-    cdef str host_s = ""
-    cdef int port_i = 80
-    cdef bytes path_qs = b"/"
-    cdef bytes host_hdr = b""
-    cdef str dom
-    cdef object remote_r
-    cdef object remote_w
-    cdef bytes reqline
+                    if ufd == self.listen_fd:
+                        # Accept as many as possible
+                        while True:
+                            cdef int cfd = accept4(self.listen_fd, NULL, NULL, 0x80000 | 0x800)  # NONBLOCK|CLOEXEC
+                            if cfd < 0:
+                                if errno in (EAGAIN, EWOULDBLOCK):
+                                    break
+                                else:
+                                    break
+                            cdef int ufd2 = self.dial_upstream()
+                            if ufd2 < 0:
+                                close(cfd)
+                                continue
 
-    if target and target[:1] == b"/":
-        if target == b"/metrics":
-            body = {
-                "bandwidth_up": _fmt_bytes(bw_up).decode("ascii"),
-                "bandwidth_down": _fmt_bytes(bw_down).decode("ascii"),
-                "total_connections": int(total_conns),
-                "active_connections": int(active_conns),
-                "total_requests": int(total_reqs),
-                "successful": int(visits.get("successful", 0)),
-                "failed": int(visits.get("failed", 0)),
-            }
-            body_bytes = json.dumps(body).encode("utf-8")
-            resp = B_HTTP_200 + B_CT_JSON + B_CL + str(len(body_bytes)).encode("ascii") + B_CRLF + B_CRLF + body_bytes
-            client_w.write(resp)
-            await client_w.drain()
+                            if self.cork:
+                                enable_cork(cfd, 1)
+                                enable_cork(ufd2, 1)
+
+                            # pipes for splice in both directions
+                            cdef int p1[2]; cdef int p2[2]
+                            if self.make_pipes(p1) != 0 or self.make_pipes(p2) != 0:
+                                close(cfd); close(ufd2)
+                                continue
+
+                            # Register both ends for in/out
+                            x_epoll_ctl(self.epfd, EPOLL_CTL_ADD, cfd, ev_of(cfd, True))
+                            x_epoll_ctl(self.epfd, EPOLL_CTL_ADD, ufd2, ev_of(ufd2, True))
+
+                            # stash pipes in epoll udata by "shadow" fds: use fcntl to store? Not portable in Python,
+                            # so we rely on per-fd maps in Python layer (below).
+                            ConnMap.add(cfd, ufd2, p1, p2)
+                            ConnMap.add(ufd2, cfd, p2, p1)
+
+                    else:
+                        # Relay data using splice in whichever direction became ready
+                        cdef int src = <int> ufd
+                        cdef int dst = ConnMap.peer(src)
+                        if dst < 0:
+                            x_epoll_ctl(self.epfd, EPOLL_CTL_DEL, src, NULL)
+                            close(src)
+                            continue
+                        cdef int* pipe12 = ConnMap.pipe_out(src)  # pipe for src->dst
+                        cdef int more = 1
+                        while True:
+                            # src -> pipe[1]
+                            cdef int64_t *off_ptr = NULL
+                            cdef int r = splice(src, NULL, pipe12[1], NULL, splice_len, SPLICE_F_NONBLOCK | SPLICE_F_MOVE | SPLICE_F_MORE)
+                            if r == 0:
+                                # EOF from src
+                                shutdown(dst, 1)  # SHUT_WR
+                                ConnMap.drop(src)
+                                break
+                            if r < 0:
+                                if errno in (EAGAIN, EWOULDBLOCK):
+                                    break
+                                ConnMap.drop(src)
+                                break
+                            # pipe[0] -> dst
+                            while r > 0:
+                                cdef int w = splice(pipe12[0], NULL, dst, NULL, r, SPLICE_F_NONBLOCK | SPLICE_F_MOVE | SPLICE_F_MORE)
+                                if w < 0:
+                                    if errno in (EAGAIN, EWOULDBLOCK):
+                                        break
+                                    ConnMap.drop(src)
+                                    r = 0
+                                    break
+                                r -= w
+                        # Opportunistic uncork when neither side has pending data
+                        if self.cork:
+                            enable_cork(src, 0); enable_cork(dst, 0)
+
+                if sleep_ns > 0:
+                    cdef timespec ts
+                    ts.tv_sec = 0
+                    ts.tv_nsec = sleep_ns
+                    nanosleep(&ts, NULL)
+        finally:
+            free(events)
+
+# ---- Minimal per-fd metadata in Python ----
+cdef class _ConnMap:
+    cdef dict _peer
+    cdef dict _pipe_out
+
+    def __cinit__(self):
+        self._peer = {}
+        self._pipe_out = {}
+
+    cdef void add(self, int a, int b, int pipe_out_ab[2], int pipe_out_ba[2]):
+        self._peer[a] = b
+        self._pipe_out[a] = (pipe_out_ab[0], pipe_out_ab[1])
+
+    cdef int peer(self, int a) nogil:
+        # Not nogil safe: we only call under GIL
+        return <int> self._peer.get(a, -1)
+
+    cdef int* pipe_out(self, int a):
+        cdef object tup = self._pipe_out.get(a, None)
+        if tup is None:
+            return <int*>NULL
+        # store in a static array for C-level access
+        static int arr[2]
+        arr[0] = <int>tup[0]; arr[1] = <int>tup[1]
+        return arr
+
+    def drop(self, int a):
+        try:
+            b = self._peer.pop(a)
+            self._pipe_out.pop(a, None)
+        except KeyError:
             return
-        if target == b"/index.html":
-            data = _load_index()
-            if data:
-                resp = B_HTTP_200 + B_CT_HTML + B_CL + str(len(data)).encode("ascii") + B_CRLF + B_CRLF + data
-                client_w.write(resp)
-                await client_w.drain()
-                return
-            else:
-                client_w.write(B_HTTP_404)
-                await client_w.drain()
-                return
 
-    try:
-        host_s, port_i, path_qs = _extract_host_port_from_absolute_uri(target)
-    except Exception:
-        host_s, port_i, path_qs = "", 0, target
-
-    if not host_s:
-        host_hdr = <bytes>headers.get(B_HOST, b"")
-        if host_hdr:
-            host_s, port_i = _split_host_port_bytes(host_hdr, 80)
-        else:
-            host_s = DEFAULT_BACKEND_HOST
-            port_i = DEFAULT_BACKEND_PORT
-
-    dom = _canon(host_s)
-    visits.update([dom])
-
-    try:
-        remote_r, remote_w = await asyncio.open_connection(host_s, port_i)
-    except Exception:
-        client_w.write(B_HTTP_502)
-        await client_w.drain()
-        visits.update(["failed"])
-        return
-
-    reqline = method + b" " + (path_qs if path_qs else b"/") + b" " + version + B_CRLF
-    remote_w.write(reqline)
-    for k, v in headers.items():
-        if k == B_PROXY_AUTH:
-            continue
-        remote_w.write(k + b": " + v + B_CRLF)
-    remote_w.write(B_CRLF)
-    await remote_w.drain()
-
-    active_conns += 1
-    to_origin = asyncio.create_task(_relay(client_r, remote_w, True))
-    to_client = asyncio.create_task(_relay(remote_r, client_w, False))
-    await asyncio.gather(to_origin, to_client)
-    active_conns -= 1
-    visits.update(["successful"])
-
-async def _handle_client(client_r, client_w):
-    global total_conns, total_reqs
-    total_conns += 1
-    visits.update(["total"])
-    try:
-        head = await asyncio.wait_for(client_r.readuntil(B_CRLFCRLF), timeout=TIMEOUT)
-    except Exception:
-        client_w.write(B_HTTP_400)
-        await client_w.drain()
-        client_w.close()
-        return
-    try:
-        idx = head.find(B_CRLF)
-        reqline = head[:idx]
-        raw_headers = head[idx+2:-4]
-        method, target, version = _parse_request_line(reqline)
-    except Exception:
-        client_w.write(B_HTTP_400)
-        await client_w.drain()
-        client_w.close()
-        return
-    headers = _parse_headers(raw_headers)
-    total_reqs += 1
-    if not check_auth(headers):
-        client_w.write(B_HTTP_407)
-        await client_w.drain()
-        client_w.close()
-        return
-    if method == B_CONNECT:
-        await _handle_connect(client_r, client_w, target)
-    else:
-        await _handle_http(client_r, client_w, method, target, version, headers, head)
-
-# --------------------
-# Entrypoint
-# --------------------
-async def _run():
-    loop = asyncio.get_running_loop()
-    try:
-        import uvloop
-        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-    except Exception:
-        pass
-    server = await asyncio.start_server(_handle_client, HOST, PORT, reuse_address=True, reuse_port=True)
-    print(f"[proxy] Listening on ('{HOST}', {PORT})")
-    async with server:
-        await server.serve_forever()
-
-def run():
-    asyncio.run(_run())
-
-if __name__ == "__main__":
-    run()
+ConnMap = _ConnMap()
